@@ -14,7 +14,7 @@ install:
 	pip install -r requirements.txt
 
 run:
-	uvicorn app:app --host 0.0.0.0 --port $(PORT) --reload
+	uvicorn app:app --host 127.0.0.1 --port $(PORT) --reload
 
 clean:
 	find . -type d -name __pycache__ -exec rm -r {} + 2>/dev/null || true
