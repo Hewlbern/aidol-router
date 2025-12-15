@@ -27,7 +27,12 @@ app = FastAPI(title="OpenRouter Service")
 # Add CORS middleware to allow frontend requests
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],  # Next.js default ports
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",  # Next.js default ports
+        "https://www.dreammachine.one",
+        "https://goonerai.vercel.app",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

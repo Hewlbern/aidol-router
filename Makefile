@@ -1,6 +1,6 @@
 .PHONY: help install run clean
 
-PORT ?= 8002
+PORT ?= 8000
 
 help:
 	@echo "Available targets:"
