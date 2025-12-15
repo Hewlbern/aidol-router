@@ -153,10 +153,11 @@ def get_conversation_path(conversation_id: str) -> str:
 
 def create_chat_record(conversation_id: str, user_id: str, character_id: str):
     """
-    Create a record in the chats table to link conversation to user and character
+    Create or update a record in the chats table.
+    The chats table only stores metadata - the JSON file in Supabase Storage contains all messages.
     
     Args:
-        conversation_id: UUID of the conversation (used as chat.id)
+        conversation_id: UUID of the conversation (used as chat.id, also the JSON filename)
         user_id: UUID of the user
         character_id: UUID of the character
     """
@@ -164,7 +165,7 @@ def create_chat_record(conversation_id: str, user_id: str, character_id: str):
         supabase = get_supabase_client()
         
         # Insert or update chat record
-        # Use conversation_id as the chat.id to link storage to database
+        # Use conversation_id as the chat.id to link to JSON file: {conversation_id}.json
         result = supabase.table("chats").upsert(
             {
                 "id": conversation_id,
@@ -178,10 +179,34 @@ def create_chat_record(conversation_id: str, user_id: str, character_id: str):
         if hasattr(result, 'error') and result.error:
             logger.warning(f"Failed to create chat record: {result.error}")
         else:
-            logger.debug(f"Created chat record: conversation_id={conversation_id}, user_id={user_id}, character_id={character_id}")
+            logger.debug(f"Created/updated chat record: conversation_id={conversation_id}, user_id={user_id}, character_id={character_id}")
     except Exception as e:
         # Don't fail the conversation creation if database record fails
         logger.warning(f"Failed to create chat record in database: {e}")
+
+def update_chat_timestamp(conversation_id: str):
+    """
+    Update the updated_at timestamp in the chats table when the JSON file is modified.
+    This provides a reference point for when the conversation was last updated.
+    
+    Args:
+        conversation_id: UUID of the conversation (chat.id)
+    """
+    try:
+        supabase = get_supabase_client()
+        
+        # Update the updated_at timestamp to reflect JSON file modification
+        result = supabase.table("chats").update({
+            "updated_at": datetime.utcnow().isoformat()
+        }).eq("id", conversation_id).execute()
+        
+        if hasattr(result, 'error') and result.error:
+            logger.debug(f"Failed to update chat timestamp: {result.error}")
+        else:
+            logger.debug(f"Updated chat timestamp for conversation {conversation_id}")
+    except Exception as e:
+        # Don't fail if timestamp update fails - JSON is source of truth
+        logger.debug(f"Failed to update chat timestamp: {e}")
 
 def create_conversation(user_id: Optional[str] = None, character_id: Optional[str] = None) -> str:
     """
@@ -301,27 +326,87 @@ def save_conversation(conversation_id: str, conversation_data: dict):
         logger.error(f"Exception saving conversation {conversation_id}: {e}")
         raise Exception(f"Failed to save conversation to Supabase Storage: {e}")
 
-def add_message_to_conversation(conversation_id: str, role: str, content: str):
-    """Add a message to a conversation"""
-    conversation = load_conversation(conversation_id)
+def ensure_chat_record_exists(conversation_id: str, user_id: Optional[str] = None, character_id: Optional[str] = None) -> bool:
+    """
+    Ensure the chat record exists in the database. If not, try to create it.
+    The chat record is just metadata - the JSON file contains all messages.
     
-    if conversation is None:
-        # Create new conversation if it doesn't exist
-        conversation = {
-            "id": conversation_id,
-            "created_at": datetime.utcnow().isoformat(),
-            "updated_at": datetime.utcnow().isoformat(),
-            "messages": []
+    Args:
+        conversation_id: UUID of the conversation (used as chat.id, also JSON filename)
+        user_id: Optional user ID (will try to get from existing chat if not provided)
+        character_id: Optional character ID (will try to get from existing chat if not provided)
+    
+    Returns:
+        True if chat record exists or was created, False otherwise
+    """
+    try:
+        supabase = get_supabase_client()
+        
+        # Check if chat exists
+        chat_check = supabase.table("chats").select("id, user_id, character_id").eq("id", conversation_id).execute()
+        
+        if chat_check.data and len(chat_check.data) > 0:
+            # Chat exists
+            return True
+        
+        # Chat doesn't exist - try to create it if we have user_id and character_id
+        if user_id and character_id:
+            create_chat_record(conversation_id, user_id, character_id)
+            return True
+        else:
+            logger.debug(f"Chat {conversation_id} not found in database and cannot create without user_id and character_id")
+            return False
+    except Exception as e:
+        logger.warning(f"Error checking/creating chat record: {e}")
+        return False
+
+def add_message_to_conversation(conversation_id: str, role: str, content: str, user_id: Optional[str] = None, character_id: Optional[str] = None):
+    """
+    Add a message to a conversation.
+    JSON file in Supabase Storage is the ONLY source of truth for messages.
+    The database chats table only stores metadata (user_id, character_id, timestamps).
+    
+    Args:
+        conversation_id: UUID of the conversation (also the JSON filename: {conversation_id}.json)
+        role: Message role ('user' or 'assistant')
+        content: Message content
+        user_id: Optional user ID (used to create/update chat record metadata)
+        character_id: Optional character ID (used to create/update chat record metadata)
+    """
+    try:
+        # Load conversation from JSON (source of truth)
+        conversation = load_conversation(conversation_id)
+        
+        if conversation is None:
+            # Create new conversation if it doesn't exist
+            logger.info(f"Creating new conversation {conversation_id} for message")
+            conversation = {
+                "id": conversation_id,
+                "created_at": datetime.utcnow().isoformat(),
+                "updated_at": datetime.utcnow().isoformat(),
+                "messages": []
+            }
+        
+        message = {
+            "role": role,
+            "content": content,
+            "timestamp": datetime.utcnow().isoformat()
         }
-    
-    message = {
-        "role": role,
-        "content": content,
-        "timestamp": datetime.utcnow().isoformat()
-    }
-    
-    conversation["messages"].append(message)
-    save_conversation(conversation_id, conversation)
+        
+        conversation["messages"].append(message)
+        logger.debug(f"Added {role} message to conversation {conversation_id}: {content[:50]}...")
+        
+        # Save to JSON file (source of truth)
+        save_conversation(conversation_id, conversation)
+        logger.debug(f"Successfully saved conversation {conversation_id} with {len(conversation['messages'])} messages to JSON")
+        
+        # Update chat record metadata (ensure it exists and update timestamp)
+        if user_id and character_id:
+            ensure_chat_record_exists(conversation_id, user_id, character_id)
+        update_chat_timestamp(conversation_id)
+    except Exception as e:
+        logger.error(f"Error adding message to conversation {conversation_id}: {e}")
+        raise
 
 def get_conversation_messages(conversation_id: str) -> list[dict[str, str]]:
     """Get all messages from a conversation in the format expected by the API"""

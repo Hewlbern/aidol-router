@@ -1,5 +1,6 @@
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import httpx
 import os
@@ -23,6 +24,15 @@ load_dotenv()
 
 app = FastAPI(title="OpenRouter Service")
 
+# Add CORS middleware to allow frontend requests
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],  # Next.js default ports
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 if not OPENROUTER_API_KEY:
     raise ValueError("OPENROUTER_API_KEY environment variable must be set in .env file")
@@ -37,6 +47,9 @@ DEFAULT_SYSTEM_PROMPT = os.getenv(
     "cohesive and engaging experience. Avoid controversial topics and ensure that all interactions are "
     "appropriate and respectful."
 )
+
+# Default AI model
+DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "nousresearch/hermes-3-llama-3.1-70b")
 
 # Optional OpenRouter headers
 HTTP_REFERER = os.getenv("HTTP_REFERER", "")
@@ -59,6 +72,8 @@ class WebSocketMessage(BaseModel):
     user_id: str | None = None
     message: str | None = None
     conversation_id: str | None = None
+    system_prompt: str | None = None  # Optional: custom system prompt, uses DEFAULT_SYSTEM_PROMPT if not provided
+    model: str | None = None  # Optional: AI model to use, uses DEFAULT_MODEL if not provided
 
 def prepare_messages(request: ChatRequest, conversation_id: str) -> list[dict[str, str]]:
     """Prepare messages with system prompt and conversation history"""
@@ -107,7 +122,7 @@ async def health():
 @app.get("/conversation/{conversation_id}")
 async def get_conversation(conversation_id: str):
     """
-    Get conversation history by UUID
+    Get conversation history by UUID (from JSON file - source of truth)
     
     Returns the full conversation including:
     - id: Conversation UUID
@@ -152,6 +167,7 @@ async def get_conversation(conversation_id: str):
             }
         )
 
+
 @app.post("/chat")
 async def chat(request: ChatRequest):
     """Generate a non-streaming chat response"""
@@ -165,7 +181,7 @@ async def chat(request: ChatRequest):
     # Save user messages to conversation
     for msg in request.messages:
         if msg.get("role") != "system":
-            add_message_to_conversation(conversation_id, msg["role"], msg["content"])
+            add_message_to_conversation(conversation_id, msg["role"], msg["content"], request.user_id, request.character_id)
     
     # Prepare messages with history
     messages = prepare_messages(request, conversation_id)
@@ -192,7 +208,7 @@ async def chat(request: ChatRequest):
         if "choices" in result and len(result["choices"]) > 0:
             assistant_message = result["choices"][0].get("message", {}).get("content", "")
             if assistant_message:
-                add_message_to_conversation(conversation_id, "assistant", assistant_message)
+                add_message_to_conversation(conversation_id, "assistant", assistant_message, request.user_id, request.character_id)
         
         # Add conversation_id to response
         result["conversation_id"] = conversation_id
@@ -211,7 +227,7 @@ async def chat_stream(request: ChatRequest):
     # Save user messages to conversation
     for msg in request.messages:
         if msg.get("role") != "system":
-            add_message_to_conversation(conversation_id, msg["role"], msg["content"])
+            add_message_to_conversation(conversation_id, msg["role"], msg["content"], request.user_id, request.character_id)
     
     # Prepare messages with history
     messages = prepare_messages(request, conversation_id)
@@ -245,7 +261,7 @@ async def chat_stream(request: ChatRequest):
                         if data == "[DONE]":
                             # Save complete assistant response
                             if full_response:
-                                add_message_to_conversation(conversation_id, "assistant", full_response)
+                                add_message_to_conversation(conversation_id, "assistant", full_response, request.user_id, request.character_id)
                             # Send done event with conversation_id
                             yield f"data: {json.dumps({'conversation_id': conversation_id, 'type': 'done'})}\n\n"
                             break
@@ -315,6 +331,7 @@ async def websocket_chat(websocket: WebSocket):
                 user_id = message_data.get("user_id")
                 initial_message = message_data.get("message", "")
                 provided_conversation_id = message_data.get("conversation_id")  # Optional: use existing chat ID
+                system_prompt = message_data.get("system_prompt")  # Optional: custom system prompt
                 
                 if not character_id:
                     await websocket.send_json({
@@ -340,12 +357,15 @@ async def websocket_chat(websocket: WebSocket):
                 
                 # If there's an initial message, process it
                 if initial_message:
+                    model = message_data.get("model")  # Optional: custom model
                     await process_websocket_message(
                         websocket,
                         conversation_id,
                         initial_message,
                         character_id,
-                        user_id
+                        user_id,
+                        system_prompt,
+                        model
                     )
             
             # Send message in existing conversation
@@ -354,6 +374,8 @@ async def websocket_chat(websocket: WebSocket):
                 conversation_id = message_data.get("conversation_id") or conversation_id
                 character_id = message_data.get("character_id") or character_id
                 user_id = message_data.get("user_id") or user_id
+                system_prompt = message_data.get("system_prompt")  # Optional: custom system prompt
+                model = message_data.get("model")  # Optional: custom model
                 
                 if not message_content:
                     await websocket.send_json({
@@ -374,7 +396,9 @@ async def websocket_chat(websocket: WebSocket):
                     conversation_id,
                     message_content,
                     character_id,
-                    user_id
+                    user_id,
+                    system_prompt,
+                    model
                 )
             
             else:
@@ -400,12 +424,27 @@ async def process_websocket_message(
     conversation_id: str,
     message_content: str,
     character_id: str | None,
-    user_id: str | None
+    user_id: str | None,
+    system_prompt: str | None = None,
+    model: str | None = None
 ):
-    """Process a message and stream the response via WebSocket"""
+    """
+    Process a message and stream the response via WebSocket
+    
+    Args:
+        websocket: WebSocket connection
+        conversation_id: UUID of the conversation
+        message_content: User's message content
+        character_id: Optional character ID
+        user_id: Optional user ID
+        system_prompt: Optional custom system prompt (uses DEFAULT_SYSTEM_PROMPT if not provided)
+        model: Optional AI model to use (uses DEFAULT_MODEL if not provided)
+    """
     try:
-        # Save user message
-        add_message_to_conversation(conversation_id, "user", message_content)
+        # Save user message to Supabase Storage (JSON is source of truth)
+        logger.info(f"Saving user message to conversation {conversation_id}: {message_content[:50]}...")
+        add_message_to_conversation(conversation_id, "user", message_content, user_id, character_id)
+        logger.info(f"User message saved successfully to conversation {conversation_id}")
         
         # Notify client that message was received
         await websocket.send_json({
@@ -414,11 +453,15 @@ async def process_websocket_message(
         })
         
         # Prepare messages with history
+        # Use provided system_prompt or fall back to DEFAULT_SYSTEM_PROMPT
         history_messages = get_conversation_messages(conversation_id)
-        system_prompt = DEFAULT_SYSTEM_PROMPT
-        messages = [{"role": "system", "content": system_prompt}]
+        prompt_to_use = system_prompt or DEFAULT_SYSTEM_PROMPT
+        messages = [{"role": "system", "content": prompt_to_use}]
         messages.extend([msg for msg in history_messages if msg.get("role") != "system"])
         messages.append({"role": "user", "content": message_content})
+        
+        # Use provided model or fall back to DEFAULT_MODEL
+        model_to_use = model or DEFAULT_MODEL
         
         # Stream response from OpenRouter
         full_response = ""
@@ -433,7 +476,7 @@ async def process_websocket_message(
                 OPENROUTER_API_URL,
                 headers=get_headers(),
                 json={
-                    "model": "nousresearch/hermes-3-llama-3.1-70b",
+                    "model": model_to_use,
                     "messages": messages,
                     "stream": True,
                     "temperature": 0.7,
@@ -448,7 +491,9 @@ async def process_websocket_message(
                         if data == "[DONE]":
                             # Save complete assistant response
                             if full_response:
-                                add_message_to_conversation(conversation_id, "assistant", full_response)
+                                logger.info(f"Saving assistant response to conversation {conversation_id}: {len(full_response)} chars")
+                                add_message_to_conversation(conversation_id, "assistant", full_response, user_id, character_id)
+                                logger.info(f"Assistant response saved successfully to conversation {conversation_id}")
                             await websocket.send_json({
                                 "type": "response_complete",
                                 "conversation_id": conversation_id
