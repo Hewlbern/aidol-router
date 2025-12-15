@@ -1,0 +1,19 @@
+services:
+  openrouter-service:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      # Load from .env file or set here
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+      # Optional: Custom system prompt (defaults to ourdream.ai/chat style)
+      # - SYSTEM_PROMPT=${SYSTEM_PROMPT}
+      # Optional: OpenRouter headers for rankings
+      # - HTTP_REFERER=${HTTP_REFERER}
+      # - X_TITLE=${X_TITLE}
+      # Supabase configuration
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
+      - SUPABASE_STORAGE_BUCKET=${SUPABASE_STORAGE_BUCKET:-conversations}
+    restart: unless-stopped
+
