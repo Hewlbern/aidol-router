@@ -31,6 +31,9 @@ app.add_middleware(
         "http://localhost:3000",
         "http://127.0.0.1:3000",  # Next.js default ports
         "https://www.dreammachine.one",
+        "https://dreammachine.one",
+        "https://api.dreammachine.one",
+        "https://www.api.dreammachine.one",
         "https://goonerai.vercel.app",
     ],
     allow_credentials=True,
