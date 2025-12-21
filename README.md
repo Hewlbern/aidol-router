@@ -23,6 +23,8 @@ OPENROUTER_API_KEY=your_key
 SUPABASE_URL=https://your-project.supabase.co
 SUPABASE_SERVICE_ROLE_KEY=your_service_role_key
 SUPABASE_STORAGE_BUCKET=conversations
+ELEVENLABS_API_KEY=your_elevenlabs_key
+OPENAI_API_KEY=your_openai_key
 
 # Run
 make run  # or docker-compose up -d
@@ -70,6 +72,32 @@ Message: {
 }
 ```
 
+**Text to Speech (TTS)**
+```
+POST /tts?download=false
+Body: {
+  "messages": [{"role": "user", "content": "Hello!"}],
+  "model": "optional-openrouter-model",
+  "conversation_id": "optional-uuid",
+  "voice_id": "optional-elevenlabs-voice-id",
+  ...
+}
+Returns: JSON with text and audio_base64, or audio file if download=true
+```
+
+**Transcription (Voice to Text + TTS)**
+```
+POST /transcribe?download=false
+Form Data:
+  - file: Audio file (optional if text provided)
+  - text: Text to convert (optional if file provided)
+  - language: "en" (optional, for transcription)
+  - voice_id: ElevenLabs voice ID (optional)
+  - conversation_id: "optional-uuid"
+  ...
+Returns: JSON with text and audio_base64, or audio file if download=true
+```
+
 ## Conversation Memory
 
 Conversations are saved with full history. When `conversation_id` is provided, history is automatically loaded and included in API requests.
@@ -109,9 +137,15 @@ Conversations are saved with full history. When `conversation_id` is provided, h
 | `SUPABASE_URL` | Yes | Supabase project URL |
 | `SUPABASE_SERVICE_ROLE_KEY` | Yes | Service role key (not anon) |
 | `SUPABASE_STORAGE_BUCKET` | No | Bucket name (default: `conversations`) |
+| `ELEVENLABS_API_KEY` | Yes | ElevenLabs API key for TTS |
+| `OPENAI_API_KEY` | Yes | OpenAI API key for Whisper transcription |
 | `SYSTEM_PROMPT` | No | Custom system prompt |
 | `HTTP_REFERER` | No | OpenRouter referer header |
 | `X_TITLE` | No | OpenRouter title header |
+| `DEFAULT_MODEL` | No | Default OpenRouter model |
+| `ELEVENLABS_DEFAULT_VOICE_ID` | No | Default ElevenLabs voice ID |
+| `ELEVENLABS_DEFAULT_MODEL_ID` | No | Default ElevenLabs model (default: `eleven_turbo_v2_5`) |
+| `WHISPER_MODEL` | No | Whisper model (default: `whisper-1`) |
 
 ## Development
 

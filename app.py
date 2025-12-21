@@ -1,6 +1,7 @@
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Query, UploadFile, File, Form
+from fastapi.responses import StreamingResponse, Response, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+import base64
 from pydantic import BaseModel
 import httpx
 import os
@@ -14,6 +15,8 @@ from memory import (
     add_message_to_conversation,
     load_conversation,
 )
+from tts import text_to_speech, text_to_speech_stream
+from transcription import speech_to_text
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -82,6 +85,22 @@ class WebSocketMessage(BaseModel):
     conversation_id: str | None = None
     system_prompt: str | None = None  # Optional: custom system prompt, uses DEFAULT_SYSTEM_PROMPT if not provided
     model: str | None = None  # Optional: AI model to use, uses DEFAULT_MODEL if not provided
+
+class TTSRequest(BaseModel):
+    messages: list[dict[str, str]]  # Messages for OpenRouter text generation
+    model: str | None = None  # OpenRouter model, uses DEFAULT_MODEL if not provided
+    temperature: float = 0.7
+    max_tokens: int = 1000
+    system_prompt: str | None = None
+    conversation_id: str | None = None
+    user_id: str | None = None
+    character_id: str | None = None
+    voice_id: str | None = None  # ElevenLabs voice ID
+    model_id: str | None = None  # ElevenLabs model
+    stability: float = 0.5
+    similarity_boost: float = 0.75
+    style: float = 0.0
+    use_speaker_boost: bool = True
 
 def prepare_messages(request: ChatRequest, conversation_id: str) -> list[dict[str, str]]:
     """Prepare messages with system prompt and conversation history"""
@@ -293,6 +312,260 @@ async def chat_stream(request: ChatRequest):
             "Connection": "keep-alive",
         },
     )
+
+@app.post("/tts")
+async def tts(
+    request: TTSRequest,
+    download: bool = Query(False, description="If true, returns audio file directly for download instead of JSON")
+):
+    """
+    Generate text via OpenRouter and convert to speech using ElevenLabs API.
+    Returns both the generated text and the audio.
+    
+    Query Parameters:
+        download (bool): If true, returns audio file directly for download. If false, returns JSON with base64 audio.
+    
+    Request body:
+    {
+        "messages": [{"role": "user", "content": "Hello!"}],
+        "model": "optional-openrouter-model",
+        "conversation_id": "optional-uuid",
+        "voice_id": "optional-voice-id",
+        ...
+    }
+    
+    Returns:
+        If download=false (default): JSON with text and audio (base64 encoded MP3)
+        If download=true: Audio file (MP3) with Content-Disposition header for download
+    """
+    import re
+    
+    # Get or create conversation
+    conversation_id = get_or_create_conversation(
+        request.conversation_id,
+        request.user_id,
+        request.character_id
+    )
+    
+    # Save user messages to conversation
+    for msg in request.messages:
+        if msg.get("role") != "system":
+            add_message_to_conversation(
+                conversation_id, msg["role"], msg["content"],
+                request.user_id, request.character_id
+            )
+    
+    # Prepare messages with history
+    chat_request = ChatRequest(
+        model=request.model or DEFAULT_MODEL,
+        messages=request.messages,
+        temperature=request.temperature,
+        max_tokens=request.max_tokens,
+        system_prompt=request.system_prompt,
+        conversation_id=conversation_id,
+        user_id=request.user_id,
+        character_id=request.character_id,
+    )
+    messages = prepare_messages(chat_request, conversation_id)
+    
+    # Generate text via OpenRouter
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            OPENROUTER_API_URL,
+            headers=get_headers(),
+            json={
+                "model": chat_request.model,
+                "messages": messages,
+                "temperature": request.temperature,
+                "max_tokens": request.max_tokens,
+            },
+            timeout=60.0,
+        )
+        response.raise_for_status()
+        result = response.json()
+        
+        # Extract generated text
+        if "choices" not in result or len(result["choices"]) == 0:
+            raise HTTPException(status_code=500, detail="No response from OpenRouter")
+        
+        generated_text = result["choices"][0].get("message", {}).get("content", "")
+        if not generated_text:
+            raise HTTPException(status_code=500, detail="Empty response from OpenRouter")
+        
+        # Save assistant response to conversation
+        add_message_to_conversation(
+            conversation_id, "assistant", generated_text,
+            request.user_id, request.character_id
+        )
+    
+    # Convert text to speech
+    audio_data = await text_to_speech(
+        text=generated_text,
+        voice_id=request.voice_id,
+        model_id=request.model_id,
+        stability=request.stability,
+        similarity_boost=request.similarity_boost,
+        style=request.style,
+        use_speaker_boost=request.use_speaker_boost,
+    )
+    
+    # Return audio file or JSON
+    if download:
+        safe_text = re.sub(r'[^\w\s-]', '', generated_text[:50]).strip()
+        safe_text = re.sub(r'[-\s]+', '-', safe_text)
+        filename = f"tts-{safe_text}.mp3" if safe_text else "tts-audio.mp3"
+        
+        return Response(
+            content=audio_data,
+            media_type="audio/mpeg",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "Content-Length": str(len(audio_data)),
+                "X-Conversation-Id": conversation_id or "",
+            },
+        )
+    else:
+        return JSONResponse(content={
+            "text": generated_text,
+            "audio_base64": base64.b64encode(audio_data).decode('utf-8'),
+            "conversation_id": conversation_id,
+            "audio_format": "mp3",
+            "audio_size_bytes": len(audio_data),
+        })
+
+@app.post("/transcribe")
+async def transcribe(
+    file: UploadFile | None = File(None, description="Audio file to transcribe (optional if text provided)"),
+    text: str | None = Form(None, description="Text to convert to speech (optional if file provided)"),
+    model: str | None = Form(None, description="Whisper model to use (default: whisper-1)"),
+    language: str | None = Form(None, description="Language code (e.g., 'en', 'es', 'fr')"),
+    prompt: str | None = Form(None, description="Optional text prompt to guide the model"),
+    temperature: float = Form(0.0, description="Sampling temperature (0.0-1.0)"),
+    conversation_id: str | None = Form(None, description="Optional conversation ID to save transcription"),
+    user_id: str | None = Form(None, description="Optional user ID"),
+    character_id: str | None = Form(None, description="Optional character ID"),
+    voice_id: str | None = Form(None, description="ElevenLabs voice ID for TTS"),
+    model_id: str | None = Form(None, description="ElevenLabs model ID for TTS"),
+    stability: float = Form(0.5, description="TTS stability (0.0-1.0)"),
+    similarity_boost: float = Form(0.75, description="TTS similarity boost (0.0-1.0)"),
+    style: float = Form(0.0, description="TTS style (0.0-1.0)"),
+    use_speaker_boost: bool = Form(True, description="TTS use speaker boost"),
+    download: bool = Query(False, description="If true, returns audio file directly for download instead of JSON"),
+):
+    """
+    Convert text or audio to speech using ElevenLabs.
+    - If file provided: Transcribe audio to text, then convert to speech
+    - If text provided: Convert text directly to speech
+    Returns both the text and the generated audio.
+    
+    Request:
+        - file: Audio file (MP3, MP4, MPEG, MPGA, M4A, WAV, or WEBM) - optional if text provided
+        - text: Text to convert to speech - optional if file provided
+        - model: Whisper model (default: whisper-1) - only used if file provided
+        - language: Language code (optional, auto-detected if not provided) - only used if file provided
+        - prompt: Optional text prompt to guide the model - only used if file provided
+        - temperature: Sampling temperature (0.0-1.0) - only used if file provided
+        - conversation_id: Optional conversation ID to save text
+        - user_id: Optional user ID
+        - character_id: Optional character ID
+        - voice_id: ElevenLabs voice ID for TTS
+        - model_id: ElevenLabs model ID for TTS
+        - stability, similarity_boost, style, use_speaker_boost: TTS voice settings
+        - download: If true, returns audio file directly for download
+    
+    Returns:
+        If download=false (default): JSON with text and audio (base64 encoded MP3)
+        If download=true: Audio file (MP3) with Content-Disposition header for download
+    """
+    import re
+    
+    try:
+        input_text = None
+        
+        # Step 1: Get text from either file transcription or direct text input
+        if file:
+            # Read audio file and transcribe
+            audio_data = await file.read()
+            if not audio_data:
+                raise HTTPException(status_code=400, detail="Empty audio file")
+            
+            logger.info(f"Transcribing audio file: {file.filename} ({len(audio_data)} bytes)")
+            
+            input_text = await speech_to_text(
+                audio_data=audio_data,
+                model=model,
+                language=language,
+                prompt=prompt,
+                temperature=temperature,
+            )
+            
+            if not input_text:
+                raise HTTPException(status_code=500, detail="Empty transcription result")
+        elif text:
+            # Use provided text directly
+            input_text = text.strip()
+            if not input_text:
+                raise HTTPException(status_code=400, detail="Empty text provided")
+            logger.info(f"Using provided text: {input_text[:50]}...")
+        else:
+            raise HTTPException(status_code=400, detail="Either 'file' or 'text' must be provided")
+        
+        # Save to conversation if conversation_id provided
+        if conversation_id and input_text:
+            add_message_to_conversation(
+                conversation_id, "user", input_text,
+                user_id, character_id
+            )
+        
+        # Step 2: Convert text to speech
+        logger.info(f"Converting text to speech: {input_text[:50]}...")
+        tts_audio_data = await text_to_speech(
+            text=input_text,
+            voice_id=voice_id,
+            model_id=model_id,
+            stability=stability,
+            similarity_boost=similarity_boost,
+            style=style,
+            use_speaker_boost=use_speaker_boost,
+        )
+        
+        # Return audio file or JSON
+        if download:
+            safe_text = re.sub(r'[^\w\s-]', '', input_text[:50]).strip()
+            safe_text = re.sub(r'[-\s]+', '-', safe_text)
+            filename = f"tts-{safe_text}.mp3" if safe_text else "tts-audio.mp3"
+            
+            return Response(
+                content=tts_audio_data,
+                media_type="audio/mpeg",
+                headers={
+                    "Content-Disposition": f'attachment; filename="{filename}"',
+                    "Content-Length": str(len(tts_audio_data)),
+                    "X-Conversation-Id": conversation_id or "",
+                },
+            )
+        else:
+            return JSONResponse(content={
+                "text": input_text,
+                "audio_base64": base64.b64encode(tts_audio_data).decode('utf-8'),
+                "conversation_id": conversation_id,
+                "audio_format": "mp3",
+                "audio_size_bytes": len(tts_audio_data),
+            })
+        
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    except httpx.HTTPStatusError as e:
+        logger.error(f"API error: {e.response.status_code} - {e.response.text}")
+        raise HTTPException(
+            status_code=e.response.status_code,
+            detail=f"API error: {e.response.text}"
+        )
+    except Exception as e:
+        logger.error(f"Transcription error: {e}")
+        raise HTTPException(status_code=500, detail=f"Transcription error: {str(e)}")
 
 @app.websocket("/ws/chat")
 async def websocket_chat(websocket: WebSocket):

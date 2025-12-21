@@ -13,3 +13,4 @@ build/
 .env
 conversations/
 
+*.mp3

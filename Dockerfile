@@ -5,7 +5,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py memory.py .
+COPY app.py memory.py tts.py transcription.py .
 
 EXPOSE 8000
 

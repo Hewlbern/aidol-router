@@ -4,16 +4,27 @@ services:
     ports:
       - "8000:8000"
     environment:
-      # Load from .env file or set here
+      # OpenRouter configuration
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
       # Optional: Custom system prompt (defaults to ourdream.ai/chat style)
       # - SYSTEM_PROMPT=${SYSTEM_PROMPT}
       # Optional: OpenRouter headers for rankings
       # - HTTP_REFERER=${HTTP_REFERER}
       # - X_TITLE=${X_TITLE}
+      # Optional: Default model
+      # - DEFAULT_MODEL=${DEFAULT_MODEL}
       # Supabase configuration
       - SUPABASE_URL=${SUPABASE_URL}
       - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
       - SUPABASE_STORAGE_BUCKET=${SUPABASE_STORAGE_BUCKET:-conversations}
+      # ElevenLabs TTS configuration
+      - ELEVENLABS_API_KEY=${ELEVENLABS_API_KEY}
+      # Optional: ElevenLabs defaults
+      # - ELEVENLABS_DEFAULT_VOICE_ID=${ELEVENLABS_DEFAULT_VOICE_ID}
+      # - ELEVENLABS_DEFAULT_MODEL_ID=${ELEVENLABS_DEFAULT_MODEL_ID}
+      # OpenAI Whisper transcription configuration
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      # Optional: Whisper model
+      # - WHISPER_MODEL=${WHISPER_MODEL}
     restart: unless-stopped
 
